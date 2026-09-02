@@ -103,11 +103,31 @@ patterns rejected at configuration time.
 
 ### 5. Risks
 
-**R1 — "no default groups" is unverified and load-bearing.** Whether matrix-auth's `authenticated`
-SID matches any non-anonymous authentication regardless of authorities has not been tested. The
-entire trust model rests on it. **The first implementation task is a spike**: grant `authenticated`
-a permission, assert a machine token does not hold it. If that cannot be enforced, stop and redesign
-— the rest of this document is void.
+**R1 — RESOLVED: "no default groups" is enforceable.** Verified by `MachineIdentitySpikeTest`,
+committed alongside this document. With `Jenkins.READ` granted to `authenticated`, a control token
+carrying `SecurityRealm.AUTHENTICATED_AUTHORITY2` holds the permission, while a token carrying only
+`kerberos-machines` does not. A second case confirms an explicit `kerberos-machines` grant applies
+and that `ADMINISTER` does not leak.
+
+The mechanism is **authority-based**, not "is this authentication non-anonymous". That yields a
+design invariant which is easy to break by accident:
+
+> Machine tokens must never carry `SecurityRealm.AUTHENTICATED_AUTHORITY2`.
+
+Most security realms attach that authority as a matter of course, so a future maintainer tidying up
+token construction could silently grant every allowlisted machine whatever authenticated users can
+do. The spike is therefore retained as a permanent regression test rather than deleted.
+
+*Fidelity caveat:* verified against `MockAuthorizationStrategy` from jenkins-test-harness, not
+matrix-auth itself. Both match the `authenticated` SID the same way, and the control case passing
+shows the matching is authority-driven — but confirming directly against matrix-auth before
+implementation would close the gap entirely.
+
+**R4 — no revocation story, and globs may preclude one.** If a machine is decommissioned or
+compromised, the operator removes it from the allowlist — but a pattern such as `*$@REALM` has no
+per-machine entry to remove, and there is no deny-list. Restructuring to explicit enumeration would
+restore revocation at the cost of the zero-provisioning benefit that motivated host keytabs in the
+first place. Open question for review; deliberately not resolved here.
 
 **R2 — deployment mode affects usability.** Under `anonymousAccess: false` (the mode our controller
 now runs) every request is challenged, so keytab-backed automation gets transparent per-request
@@ -146,7 +166,18 @@ Note the existing suite mocks `KerberosAuthenticator` throughout, so none of it 
 
 Specific feedback wanted on:
 
-1. Is R1 the right thing to block on, and is there a known answer already?
-2. Is realm-inclusive matching right, or surprising to operators?
-3. Should `host/agent01.example.com` and `AGENT01$` be unified as one identity in v1?
-4. Is `kerberos-machines` as a single group too coarse?
+1. **Revocation (R4).** How should an operator revoke one machine? Globs make per-machine removal
+   impossible. Is explicit enumeration acceptable, or is a deny-list needed?
+2. **Cross-realm collision.** Matching is realm-*inclusive* but the derived username is
+   realm-*stripped*, so `host/agent01@REALM-A` and `host/agent01@REALM-B` become the same Jenkins
+   identity with the same permissions. It only bites if both realms are allowlisted, and keeping the
+   realm in the username would remove it outright. Is there a reason not to?
+3. **Threat model.** What does an attacker who owns a domain workstation actually obtain? If the
+   answer is "everything `kerberos-machines` can do", the feature's security reduces to operator
+   discipline in matrix-auth. Is that acceptable, and should the group therefore be narrower?
+4. **Does the allowlist earn its place in v1?** Deny-by-default already comes from matrix-auth: a
+   machine with no grant can do nothing. The allowlist is defence-in-depth — is that worth the
+   configuration surface?
+5. Is realm-inclusive matching right, or surprising to operators?
+6. Should `host/agent01.example.com` and `AGENT01$` be unified as one identity in v1?
+7. R1's matrix-auth fidelity caveat — worth closing before implementation?
