@@ -15,10 +15,6 @@ into Jenkins based on that information. It is designed to work well with
 the Active Directory or an LDAP plugin. It can also redirect users that omit specifying 
 a domain in their request.
 
-The authentication can be bypassed for a specific request by setting a
-Bypass-Kerberos header in the request. It doesn't matter which value it
-has, the user will be authenticated as anonymous.
-
 The Plugin can be configured to permit unauthenticated requests and
 authenticated only if requested. Otherwise, authentication is performed
 for every request.
@@ -38,17 +34,63 @@ Enable Kerberos SSO:
 security:
   kerberosSso:
     enabled: true
+    accountName: 'HTTP/jenkins.example.com'
+    password: '${KERBEROS_PASSWORD}'
     krb5Location: '/etc/krb5.conf'
     loginLocation: '/etc/login.conf'
     loginServerModule: 'spnego-server'
     loginClientModule: 'spnego-client'
     anonymousAccess: true
+    bypassPaths:
+      - '/login'
     allowLocalhost: false
     allowBasic: true
     allowDelegation: false
     allowUnsecureBasic: false
     promptNtlm: false
 ```
+
+Every key you omit is set to its **default** when the block is applied, not left alone. A partial
+block therefore resets options configured elsewhere: omitting `accountName` resets it to
+`Service account` and omitting `password` empties it. Configure the plugin either entirely through
+Configuration as Code or entirely through the UI, not half in each.
+
+An unrecognised key aborts the configuration with `Unknown field(s) specified for kerberosSso`, so
+options added in a newer release cannot be set until the plugin is upgraded.
+
+## Bypassing authentication
+
+Some clients cannot negotiate. Two mechanisms let a request through without negotiation. Neither
+grants any permission: they only skip the Kerberos exchange, leaving Jenkins' own authorization in
+charge of the resulting anonymous request.
+
+**By path.** `bypassPaths` lists request paths served without negotiation. Paths match on whole
+segments, so `/login` also covers `/login/foo` but not `/loginElsewhere`.
+
+**By header.** Setting a `Bypass-Kerberos` header on a request skips negotiation for that request,
+whatever value the header has.
+
+Paths that Jenkins core guarantees are readable without authentication are never challenged and do
+not need listing: `/login`, `/logout`, `/adjuncts/*`, `/tcpSlaveAgentListener`, `/securityRealm/*`,
+and unprotected root actions such as `/health` and `/whoAmI`.
+
+### Inbound agents cannot connect
+
+Before connecting, the remoting agent requests `/login` and requires a `200`. If it receives a `401`
+the agent will not connect, and retries do not recover
+([JENKINS-75881](https://issues.jenkins.io/browse/JENKINS-75881)).
+
+With `anonymousAccess` disabled — the default — `/login` is served unauthenticated and agents
+connect normally.
+
+With `anonymousAccess` enabled, `/login` is the only URL that still negotiates, because it is the
+one place a user can explicitly trigger sign-in. It therefore answers `401` and agents fail. Choose
+one:
+
+- **Set `anonymousAccess: false`.** Every URL negotiates, so browsers sign in on their first request
+  and `/login` is served unauthenticated. Preferred when anonymous browsing is not actually wanted.
+- **Add `/login` to `bypassPaths`.** Keeps anonymous browsing, but removes the explicit sign-in
+  entry point: with no other URL negotiating, browser single sign-on stops working entirely.
 
 ## User guide
 
