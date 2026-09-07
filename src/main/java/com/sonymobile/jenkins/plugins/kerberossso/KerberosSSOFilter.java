@@ -78,6 +78,15 @@ public class KerberosSSOFilter implements Filter {
      */
     public static final String BYPASS_HEADER = "Bypass-Kerberos";
 
+    /**
+     * Request attribute set once {@link KerberosPreCrumbAuthentication} has run this filter.
+     *
+     * That extension runs inside CrumbFilter, which core places before PluginServletFilter, so
+     * without this marker the filter would run a second time on the same request.
+     */
+    /*package*/ static final String NEGOTIATED_ATTRIBUTE =
+            KerberosSSOFilter.class.getName() + ".negotiated";
+
     private static final Logger logger = Logger.getLogger(KerberosSSOFilter.class.getName());
 
     /*package for testing*/ final transient @NonNull Map<String, String> config;
@@ -149,6 +158,12 @@ public class KerberosSSOFilter implements Filter {
 
         final HttpServletResponse httpResponse = (HttpServletResponse)response;
         final HttpServletRequest httpRequest = (HttpServletRequest)request;
+
+        if (httpRequest.getAttribute(NEGOTIATED_ATTRIBUTE) != null) {
+            // Already negotiated before crumb validation, see NEGOTIATED_ATTRIBUTE
+            chain.doFilter(request, response);
+            return;
+        }
 
         if (skipAuthentication(httpRequest)) {
             chain.doFilter(request, response);

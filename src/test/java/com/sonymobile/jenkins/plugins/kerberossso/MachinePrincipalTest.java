@@ -77,7 +77,10 @@ import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
+import static org.mockito.Mockito.clearInvocations;
 import static org.mockito.Mockito.mock;
+import static org.mockito.Mockito.times;
+import static org.mockito.Mockito.verify;
 import static org.mockito.Mockito.when;
 
 /**
@@ -90,6 +93,7 @@ public class MachinePrincipalTest {
     public JenkinsRule rule = new JenkinsRule();
 
     private KerberosSSOFilter filter;
+    private KerberosAuthenticator authenticator;
     private boolean ticketAvailable = true;
 
     @Before
@@ -210,6 +214,45 @@ public class MachinePrincipalTest {
         // 404 rather than 403: without Item.READ Jenkins hides the job instead of admitting it exists
         assertEquals("the ungranted job did not", 404, post("job/off-limits/build"));
         assertEquals(0, offLimits.getBuilds().size());
+    }
+
+    /**
+     * KerberosPreCrumbAuthentication runs the filter inside CrumbFilter, and PluginServletFilter
+     * reaches it again on the same request. A POST must negotiate once, so the ticket is never
+     * presented to the authenticator twice.
+     */
+    @Test
+    public void aPostNegotiatesOnlyOnce() throws Exception {
+        FreeStyleProject callback = rule.createFreeStyleProject("callback");
+        ProjectMatrixAuthorizationStrategy strategy = new ProjectMatrixAuthorizationStrategy();
+        strategy.add(Jenkins.READ, PermissionEntry.group("laptop-callbacks"));
+        rule.jenkins.setAuthorizationStrategy(strategy);
+        AuthorizationMatrixProperty permissions = new AuthorizationMatrixProperty(Collections.emptyList());
+        permissions.add(Item.READ, PermissionEntry.group("laptop-callbacks"));
+        permissions.add(Item.BUILD, PermissionEntry.group("laptop-callbacks"));
+        callback.addProperty(permissions);
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
+
+        fakePrincipal("host/marcos-laptop-1.remote.example.com@EXAMPLE.COM");
+        patterns("host/*-laptop-*.remote.example.com@EXAMPLE.COM -> laptop-callbacks");
+
+        try (CloseableHttpClient client = HttpClients.custom()
+                .setDefaultCookieStore(new BasicCookieStore()).build()) {
+            JSONObject crumb = crumb(client);
+            clearInvocations(authenticator);
+
+            HttpPost req = new HttpPost(rule.getURL().toExternalForm() + "job/callback/build");
+            req.addHeader(crumb.getString("crumbRequestField"), crumb.getString("crumb"));
+            try (CloseableHttpResponse response = client.execute(req)) {
+                EntityUtils.consumeQuietly(response.getEntity());
+                assertEquals(201, response.getStatusLine().getStatusCode());
+            }
+        }
+
+        verify(authenticator, times(1))
+                .authenticate(any(HttpServletRequest.class), any(HttpServletResponse.class));
+        rule.waitUntilNoActivity();
+        assertEquals(1, callback.getBuilds().size());
     }
 
     @Test
@@ -462,6 +505,7 @@ public class MachinePrincipalTest {
 
     private void fakePrincipal(String principal) throws Exception {
         KerberosAuthenticator mockAuthenticator = mock(KerberosAuthenticator.class);
+        authenticator = mockAuthenticator;
         when(mockAuthenticator.authenticate(any(HttpServletRequest.class), any(HttpServletResponse.class)))
                 .thenAnswer(invocation -> {
                     if (!ticketAvailable) {

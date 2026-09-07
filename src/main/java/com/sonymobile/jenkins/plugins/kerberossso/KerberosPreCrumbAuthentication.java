@@ -30,11 +30,12 @@ import hudson.security.csrf.CrumbExclusion;
 
 import jakarta.servlet.FilterChain;
 import jakarta.servlet.ServletException;
+import jakarta.servlet.ServletRequest;
+import jakarta.servlet.ServletResponse;
 import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 
 import java.io.IOException;
-import java.util.concurrent.atomic.AtomicBoolean;
 
 /**
  * Establishes request authentication before Jenkins validates a POST's crumb.
@@ -44,8 +45,12 @@ import java.util.concurrent.atomic.AtomicBoolean;
  * this extension never exempts an authenticated request from CSRF checks. It returns false after
  * authentication so core validates the crumb normally. It only returns true when negotiation has
  * already handled the response, without invoking the downstream chain.
+ *
+ * Ordered last so a genuine exclusion, such as a webhook endpoint another plugin exempts, decides
+ * first. Marks the request so {@link KerberosSSOFilter} does not negotiate it again once
+ * PluginServletFilter is reached.
  */
-@Extension
+@Extension(ordinal = -100)
 public class KerberosPreCrumbAuthentication extends CrumbExclusion {
 
     @Override
@@ -60,8 +65,27 @@ public class KerberosPreCrumbAuthentication extends CrumbExclusion {
             return false;
         }
 
-        AtomicBoolean continueValidation = new AtomicBoolean();
-        filter.doFilter(request, response, (req, rsp) -> continueValidation.set(true));
-        return !continueValidation.get();
+        AuthenticationProbe probe = new AuthenticationProbe();
+        filter.doFilter(request, response, probe);
+        if (!probe.continueValidation) {
+            return true;
+        }
+        request.setAttribute(KerberosSSOFilter.NEGOTIATED_ATTRIBUTE, Boolean.TRUE);
+        return false;
+    }
+
+    /**
+     * Internal continuation signal, not the downstream chain.
+     *
+     * A named private class rather than a lambda: a lambda compiles to a synthetic method on the
+     * enclosing extension, which the Jenkins security scan reports as an unguarded web method.
+     */
+    private static final class AuthenticationProbe implements FilterChain {
+        private boolean continueValidation;
+
+        @Override
+        public void doFilter(ServletRequest request, ServletResponse response) {
+            continueValidation = true;
+        }
     }
 }

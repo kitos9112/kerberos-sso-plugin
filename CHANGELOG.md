@@ -1,13 +1,3 @@
-#### **Unreleased**
-
-- Add explicit Kerberos machine/service principal allowlists and group grants for API automation.
-- Compatibility: principals whose local part contains `/` or ends in `$` no longer use the security
-  realm's user lookup, including when no machine patterns are configured. Existing users of that
-  behavior must configure explicit machine patterns and permissions before upgrading.
-- Machine authentication is per request. Use `anonymousAccess: false` and explicit user/group
-  authorization such as Matrix Authorization; do not use "Logged-in users can do anything".
-  POST clients must retain the session cookie associated with Jenkins' default CSRF crumb.
-
 #### **Version 1.5 (released 2019-02-14)**
 
 -   Fixed redirect when Jenkins has a context path
