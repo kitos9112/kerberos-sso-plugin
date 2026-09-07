@@ -129,26 +129,66 @@ public class MachinePrincipalTest {
         assertEquals("agent01$@example.com", identity().name);
     }
 
+    /**
+     * The allowlist decides, not the shape of the principal. A machine no pattern matches keeps the
+     * realm lookup it had before this feature existed. The dummy realm resolves any name, standing
+     * in for a realm that resolves computer accounts.
+     */
     @Test
-    public void machineOutsideAllowlistStaysAnonymous() throws Exception {
+    public void machineOutsideAllowlistFallsBackToTheSecurityRealm() throws Exception {
         fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
         patterns("host/*@OTHER.COM");
 
-        assertEquals("anonymous", identity().name);
+        Identity who = identity();
+        assertEquals("host/agent01.example.com", who.name);
+        assertTrue(who.authorities.contains("authenticated"));
+        assertFalse(who.authorities.contains(MachinePrincipalMapper.GROUP));
+    }
+
+    /** Configuring nothing must change nothing. */
+    @Test
+    public void machinesKeepTheirRealmLookupWhenNothingIsConfigured() throws Exception {
+        fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
+
+        assertEquals("host/agent01.example.com", identity().name);
     }
 
     /**
-     * The dummy realm resolves any name, so before this change a machine principal became a full
-     * user carrying "authenticated", as it would with any realm that resolves computer accounts.
-     * Machine principals must never reach the realm, configured or not.
+     * A Kerberos instance name such as alice/admin is a person, not a machine. It has machine shape,
+     * so no pattern must be needed for it to keep resolving as the user it belongs to.
      */
     @Test
-    public void machinesNeverReachTheSecurityRealmEvenWhenNothingIsConfigured() throws Exception {
-        fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
+    public void kerberosInstanceNamesStillResolveAsPeople() throws Exception {
+        fakePrincipal("alice/admin@EXAMPLE.COM");
+        patterns("host/*@EXAMPLE.COM -> ci-servers");
+
+        Identity who = identity();
+        assertEquals("alice/admin", who.name);
+        assertTrue(who.authorities.contains("authenticated"));
+        assertFalse(who.authorities.contains(MachinePrincipalMapper.GROUP));
+    }
+
+    /**
+     * Denial must not fall back to the realm. Otherwise revoking a computer account would restore it
+     * as an ordinary user carrying "authenticated", which is the opposite of revoking it.
+     */
+    @Test
+    public void deniedMachineStaysAnonymousRatherThanReachingTheRealm() throws Exception {
+        fakePrincipal("STOLEN$@EXAMPLE.COM");
+        patterns("!stolen$@EXAMPLE.COM");
 
         Identity who = identity();
         assertEquals("anonymous", who.name);
         assertFalse(who.authorities.contains("authenticated"));
+    }
+
+    /** Denying a whole class is how an operator opts into machines never reaching the realm. */
+    @Test
+    public void aDenyGlobLocksOutEveryComputerAccount() throws Exception {
+        fakePrincipal("AGENT01$@EXAMPLE.COM");
+        patterns("!*$@EXAMPLE.COM");
+
+        assertEquals("anonymous", identity().name);
     }
 
     /**

@@ -96,12 +96,17 @@ they do not carry the `authenticated` group authority. Omitting that authority d
 such strategies. Matrix Authorization is covered by the automated tests; other strategies need
 separate validation.
 
-**Upgrade behavior:** the filter now treats every principal whose local part contains `/` or ends
-in `$` as a machine/service principal. This includes services such as `HTTP/server@REALM`, not just
-`host/...`. These principals never reach the security realm's user lookup, even when the allowlist
-is empty. Installations whose realm previously resolved these names must configure explicit machine
-patterns and permissions before upgrading. Empty patterns admit no machines; ordinary user
-principals continue through the existing realm lookup.
+**The allowlist decides, not the shape of the principal.** A principal whose local part contains `/`
+or ends in `$` is eligible to be matched, which covers `host/...`, services such as
+`HTTP/server@REALM`, and Windows computer accounts. Eligibility alone admits nothing: a principal
+that matches no pattern takes the security realm's user lookup exactly as it did before this
+feature existed. So configuring no patterns changes nothing, and a Kerberos instance name such as
+`alice/admin@REALM` keeps resolving as the person it belongs to.
+
+A denied principal is the exception. It stays anonymous rather than falling back to the realm,
+otherwise revoking a computer account would restore it as an ordinary user. That also makes the
+stricter posture available as configuration: `!*$@EXAMPLE.COM` stops every Windows computer account
+authenticating at all, including through a realm that would otherwise resolve it.
 
 The plugin does not create or save a Jenkins user record during machine authentication. Other
 Jenkins features or plugins may create records when an identity is used. Machine names and groups

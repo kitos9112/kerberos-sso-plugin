@@ -1,9 +1,11 @@
 <div>
   Kerberos machine/service principals that may authenticate, one pattern per line. A principal whose
-  local part contains <code>/</code> or ends in <code>$</code> is treated as a machine, including
+  local part contains <code>/</code> or ends in <code>$</code> is eligible to be matched, including
   <code>host/fqdn@REALM</code>, <code>HTTP/server@REALM</code> and <code>NAME$@REALM</code>.
-  These names never use the security realm's user lookup, even with an empty allowlist. Upgrading
-  installations that previously resolved them through the realm need explicit patterns and grants.
+  Eligibility alone admits nothing. A principal matching no pattern uses the security realm's user
+  lookup as before, so leaving this empty changes nothing and an instance name such as
+  <code>alice/admin@REALM</code> still resolves as that person. A denied principal is the exception:
+  it stays anonymous instead of falling back to the realm.
 
   <p>
     Patterns match the whole principal case-insensitively. <code>*</code> is the only wildcard and

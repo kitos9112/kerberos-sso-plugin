@@ -45,9 +45,15 @@ import java.util.stream.Collectors;
  * Maps Kerberos machine principals to Jenkins identities.
  *
  * A machine is recognised by the shape of its principal: {@code host/fqdn@REALM} as issued from a
- * Unix keytab, or {@code NAME$@REALM} for a Windows computer account. Machines never go through the
- * security realm's user lookup. They are admitted only when they match a configured pattern, and
- * they authenticate as themselves carrying {@link #GROUP} plus any groups their patterns name.
+ * Unix keytab, or {@code NAME$@REALM} for a Windows computer account. Such a principal is admitted
+ * only when it matches a configured pattern, and then authenticates as itself carrying
+ * {@link #GROUP} plus any groups its patterns name, bypassing the security realm's user lookup.
+ *
+ * The allowlist decides, not the shape. A machine-shaped principal that matches nothing takes the
+ * realm lookup exactly as it did before this feature existed, so configuring no patterns changes
+ * nothing and a Kerberos instance name such as {@code alice/admin@REALM} keeps resolving as the
+ * person it belongs to. To stop a class of machine authenticating through the realm at all, deny
+ * it: {@code !*$@EXAMPLE.COM} rejects every computer account.
  *
  * A pattern is a glob, optionally followed by the groups to grant:
  * <pre>
@@ -75,6 +81,12 @@ final class MachinePrincipalMapper {
     }
 
     /**
+     * Whether a principal is shaped like a machine rather than a person.
+     *
+     * Shape alone admits nothing. It only decides which principals the patterns are consulted for,
+     * so a pattern can never turn a plain user name into a machine. A principal of this shape that
+     * no pattern matches takes the security realm's user lookup like any other name.
+     *
      * @param principalName Principal as reported by the authenticator, realm included.
      * @return true for service and computer account principals, false for users.
      */
@@ -85,14 +97,33 @@ final class MachinePrincipalMapper {
     }
 
     /**
-     * Decide whether a machine may authenticate, as whom, and in which groups.
+     * Whether a deny pattern rejects this principal.
      *
-     * A deny entry wins over every allow entry regardless of order, so one machine can be revoked
-     * from a glob that admits its peers.
+     * Deny wins over every allow entry regardless of order, so one machine can be revoked from a
+     * glob that admits its peers. A rejected principal must not fall back to the realm either, or
+     * revoking a computer account would restore it as an ordinary user.
      *
      * @param principalName Machine principal, realm included.
      * @param patterns Normalized patterns, see {@link #normalize}.
-     * @return The machine's authentication, or null when it is not allowlisted.
+     * @return true when a deny pattern matches.
+     */
+    static boolean isDenied(@NonNull String principalName, @NonNull List<String> patterns) {
+        String subject = principalName.toLowerCase(Locale.ROOT);
+        for (String pattern : patterns) {
+            if (pattern.startsWith(DENY) && globMatches(glob(pattern.substring(DENY.length())), subject)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    /**
+     * Decide whether a machine may authenticate, as whom, and in which groups.
+     *
+     * @param principalName Machine principal, realm included.
+     * @param patterns Normalized patterns, see {@link #normalize}.
+     * @return The machine's authentication, or null when no allow pattern admits it or a deny
+     *         pattern rejects it. Callers telling those apart consult {@link #isDenied}.
      */
     static @CheckForNull Authentication map(@NonNull String principalName, @NonNull List<String> patterns) {
         String subject = principalName.toLowerCase(Locale.ROOT);
