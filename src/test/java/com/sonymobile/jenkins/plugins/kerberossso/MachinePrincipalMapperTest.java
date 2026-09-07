@@ -58,6 +58,20 @@ public class MachinePrincipalMapperTest {
     }
 
     @Test
+    public void normalizeRequiresOneLiteralNonemptyRealm() {
+        for (String pattern : Arrays.asList("host/*@", "host/*@*", "host/*@EXAMPLE.*", "host/*@@EXAMPLE.COM")) {
+            assertThrows(pattern, IllegalArgumentException.class,
+                    () -> normalize(Collections.singletonList(pattern)));
+        }
+    }
+
+    @Test
+    public void normalizeRejectsAuthenticatedGroup() {
+        assertThrows(IllegalArgumentException.class,
+                () -> normalize(Collections.singletonList("host/*@EXAMPLE.COM -> callbacks, authenticated")));
+    }
+
+    @Test
     public void denyWinsRegardlessOfOrder() {
         List<String> denyFirst = normalize(Arrays.asList("!agent01$@example.com", "*$@example.com"));
         List<String> denyLast = normalize(Arrays.asList("*$@example.com", "!agent01$@example.com"));

@@ -30,6 +30,7 @@ import hudson.Util;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.core.Authentication;
 import org.springframework.security.core.GrantedAuthority;
+import org.springframework.security.core.Transient;
 import org.springframework.security.core.authority.SimpleGrantedAuthority;
 
 import java.util.ArrayList;
@@ -118,7 +119,21 @@ final class MachinePrincipalMapper {
 
         List<GrantedAuthority> authorities = groups.stream()
                 .map(SimpleGrantedAuthority::new).collect(Collectors.toList());
-        return new UsernamePasswordAuthenticationToken(subject, "", authorities);
+        return new MachineAuthentication(subject, authorities);
+    }
+
+    /**
+     * Never save machine authentication in an HTTP session. Endpoints may still create sessions for
+     * CSRF crumbs; their cookies must not authenticate a later request or bypass a changed allowlist.
+     * Spring Security checks this marker even when a response is committed inside the filter chain.
+     */
+    @Transient
+    private static final class MachineAuthentication extends UsernamePasswordAuthenticationToken {
+        private static final long serialVersionUID = 1L;
+
+        private MachineAuthentication(String subject, List<GrantedAuthority> authorities) {
+            super(subject, "", authorities);
+        }
     }
 
     /**
@@ -129,9 +144,8 @@ final class MachinePrincipalMapper {
      *
      * @param patterns Raw patterns, possibly null.
      * @return Canonical patterns, blanks and duplicates dropped.
-     * @throws IllegalArgumentException for a glob without a realm, a deny entry naming groups, or an
-     *         entry whose groups are empty. Matching is realm inclusive by design, so a realm-less
-     *         glob would admit any realm's machines; refuse it outright.
+     * @throws IllegalArgumentException for a glob without one literal, nonempty realm, a deny entry
+     *         naming groups, an empty group list after ->, or the reserved authenticated group.
      */
     static @NonNull List<String> normalize(@CheckForNull List<String> patterns) {
         List<String> normalized = new ArrayList<>();
@@ -150,11 +164,16 @@ final class MachinePrincipalMapper {
             if (glob.isEmpty()) {
                 throw new IllegalArgumentException("Machine principal pattern is missing: " + raw);
             }
-            if (!glob.contains("@")) {
-                throw new IllegalArgumentException("Machine principal pattern must name a realm: " + raw);
+            int at = glob.indexOf('@');
+            if (at <= 0 || at != glob.lastIndexOf('@') || at == glob.length() - 1
+                    || glob.substring(at + 1).contains("*")) {
+                throw new IllegalArgumentException("Machine principal pattern must name one literal, nonempty realm: " + raw);
             }
 
             List<String> groups = groups(body);
+            if (groups.stream().anyMatch("authenticated"::equalsIgnoreCase)) {
+                throw new IllegalArgumentException("Machine principal patterns cannot grant the reserved authenticated group: " + raw);
+            }
             if (deny && body.contains(GROUPS)) {
                 throw new IllegalArgumentException("A deny pattern grants nothing, drop its groups: " + raw);
             }

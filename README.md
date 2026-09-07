@@ -42,7 +42,7 @@ security:
     loginLocation: '/etc/login.conf'
     loginServerModule: 'spnego-server'
     loginClientModule: 'spnego-client'
-    anonymousAccess: true
+    anonymousAccess: false
     machinePrincipalPatterns:
       - 'host/*-laptop-*.remote.example.com@EXAMPLE.COM -> laptop-callbacks'
       - 'host/ci*.example.com@EXAMPLE.COM               -> ci-servers, production'
@@ -64,54 +64,96 @@ hosts call the Jenkins API as themselves, instead of being issued long-lived API
 ```yaml
 security:
   kerberosSso:
+    anonymousAccess: false
     machinePrincipalPatterns:
-      - 'host/*.example.com@EXAMPLE.COM'
-      - '*$@EXAMPLE.COM'
-      - '!decommissioned$@EXAMPLE.COM'
+      - 'host/*-laptop-*.example.com@EXAMPLE.COM -> laptop-callbacks'
+      - 'host/ci*.example.com@EXAMPLE.COM -> ci-servers, Production'
+      - '!host/retired-laptop-1.example.com@EXAMPLE.COM'
 ```
 
-Patterns match case-insensitively against the whole principal, realm included, with `*` as the only
-wildcard. Every pattern must name a realm, so that one realm's machines cannot be admitted by a
-pattern written for another. A pattern beginning with `!` denies, and denial always wins, which is
-how a single machine is revoked from a glob that admits its peers.
+Patterns match case-insensitively against the whole principal, realm included. `*` is the only
+wildcard and is allowed only before `@`; every pattern must name one nonempty, literal realm.
+A pattern beginning with `!` denies, and denial always wins, regardless of ordering. A new deny
+entry takes effect on the machine's next negotiated request, including requests carrying a cookie.
+It does not cancel builds or requests already running.
 
 An admitted machine authenticates as its lowercased principal, for example
-`host/agent01.example.com@example.com`. Until you grant it something it can do nothing.
+`host/agent01.example.com@example.com`. A pattern may grant groups after `->`, separated by commas.
+A machine matching several allow patterns receives the union of their groups, plus
+`kerberos-machines`. Group names keep their case. Deny patterns cannot grant groups, and
+`authenticated` is reserved and cannot be granted. In the UI, enter one pattern per line; commas
+separate groups within that line.
 
-A pattern may name the groups it grants, after `->`. This is how classes of machine are scoped
-apart: grant `Job/Build` on one job to `laptop-callbacks` and laptops may trigger that job while CI
-servers cannot, without either group needing a directory entry. A machine matching several patterns
-receives the union of their groups, and every admitted machine also belongs to `kerberos-machines`,
-so a blanket grant still reaches all of them. Group names keep their case, because authorization
-strategies match them literally; the glob is lowercased to match the lowercased principal. A deny
-pattern grants nothing, so naming groups on one is rejected.
+### Authorization and compatibility
 
-Leave the option empty, the default, and machine principals authenticate as nobody.
+Use an authorization strategy with explicit user/group grants, such as Matrix Authorization.
+Grant only the permissions each machine needs. Existing grants to the machine's name or any
+assigned group apply immediately; anonymous access granted by the strategy may also apply.
 
-### Properties worth knowing
+**Do not enable machine access with "Logged-in users can do anything" or another strategy that
+trusts every non-anonymous authentication.** Machines are authenticated identities even though
+they do not carry the `authenticated` group authority. Omitting that authority does not constrain
+such strategies. Matrix Authorization is covered by the automated tests; other strategies need
+separate validation.
 
-- **Machines never reach the security realm.** Directories contain computer objects, and a realm that
-  resolved `AGENT01$` would otherwise turn every domain workstation into a Jenkins user.
-- **Machines are not members of `authenticated`.** Permissions granted to that group do not reach
-  them, only grants to `kerberos-machines` or to the machine's own name.
-- **No Jenkins user record is created.** Machines do not appear under People, and authorization
-  strategies will not offer them for autocompletion, so the name must be typed exactly.
-- **Authentication is per request.** No session is established, so every call must carry a ticket.
-  `/whoAmI` is served without negotiation and will report `anonymous` for a machine; check a
-  protected URL instead.
-- **These identities are low trust.** Any local administrator on a domain-joined host holds that
-  host's ticket. Grant the minimum the automation needs.
+**Upgrade behavior:** the filter now treats every principal whose local part contains `/` or ends
+in `$` as a machine/service principal. This includes services such as `HTTP/server@REALM`, not just
+`host/...`. These principals never reach the security realm's user lookup, even when the allowlist
+is empty. Installations whose realm previously resolved these names must configure explicit machine
+patterns and permissions before upgrading. Empty patterns admit no machines; ordinary user
+principals continue through the existing realm lookup.
+
+The plugin does not create or save a Jenkins user record during machine authentication. Other
+Jenkins features or plugins may create records when an identity is used. Machine names and groups
+may not appear in authorization autocompletion; enter their exact names and select the appropriate
+user or group entry type.
+
+Treat these identities as low trust: a local administrator on a domain-joined host can use that
+host's credentials. In particular, granting build permission on a job allows a machine to run the
+job's configured automation and any credentials that automation uses.
 
 ### Using it
 
-```
-kinit -k -t /etc/krb5.keytab "host/$(hostname -f)"
-curl --negotiate -u : -s -o /dev/null -w '%{http_code}\n' https://jenkins.example.com/api/json
+Set `anonymousAccess: false` so protected API requests negotiate. With `anonymousAccess: true`,
+only `/login` negotiates; a machine cannot log in there and then authenticate API calls using only
+a cookie. When machine patterns are configured, unauthenticated POSTs negotiate before Jenkins
+validates their crumbs. This also applies to human principals on those POSTs; normal CSRF validation
+still runs after authentication. Paths configured for bypass and unprotected paths such as `/whoAmI` skip negotiation and
+do not establish a machine identity. Check a protected API endpoint instead.
+
+For a laptop callback, select project-based Matrix Authorization and configure:
+
+- Global `Overall/Read` for the **group** `laptop-callbacks`.
+- `Job/Read` and `Job/Build` for that group on the `callback` job only.
+- No broader grants through another matching group or machine name.
+
+The following example requires `curl` with Negotiate support and `jq`. It acquires the host ticket,
+fetches a crumb, and triggers the job. Use the principal actually present in your keytab.
+
+```sh
+set -eu
+kinit -k -t /etc/krb5.keytab "host/$(hostname -f)@EXAMPLE.COM"
+
+jenkins_url='https://jenkins.example.com'
+cookie_jar=$(mktemp)
+trap 'rm -f "$cookie_jar"' EXIT
+
+crumb_json=$(curl --fail --silent --show-error --negotiate -u : \
+  --cookie-jar "$cookie_jar" "$jenkins_url/crumbIssuer/api/json")
+crumb_field=$(printf '%s' "$crumb_json" | jq -er '.crumbRequestField')
+crumb_value=$(printf '%s' "$crumb_json" | jq -er '.crumb')
+
+curl --fail --silent --show-error --negotiate -u : \
+  --cookie "$cookie_jar" --cookie-jar "$cookie_jar" \
+  --header "$crumb_field: $crumb_value" \
+  --request POST --dump-header - --output /dev/null \
+  "$jenkins_url/job/callback/build"
 ```
 
-A `200` and a `Authenticated machine host/...` line in the Jenkins log confirm it. This requires
-every URL to negotiate, so `anonymousAccess` must be disabled; with it enabled only `/login`
-negotiates and callers must authenticate there first and reuse the session cookie.
+A successful trigger returns `201` with a queue location. Every protected request must authenticate
+with Kerberos; the cookie retains the HTTP session used by Jenkins' default CSRF crumb issuer,
+**not** the machine's authentication. Fetch a new crumb if the session expires. The job's build
+cause records the lowercased machine principal. A job without `Job/Read` is hidden with `404`.
 
 ## User guide
 

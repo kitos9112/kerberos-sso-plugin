@@ -180,6 +180,21 @@ public class JcascTest {
     }
 
     @Test
+    public void invalidMachinePatternDoesNotPartiallyApplyConfiguration() throws Exception {
+        applyConfig(getJcascYaml("full", Collections.singletonMap("REDIRECT", "acme.com")));
+        PluginImpl plugin = PluginImpl.getInstance();
+        KerberosSSOFilter filter = plugin.getFilter();
+        String invalid = getJcascYaml("full", Collections.singletonMap("REDIRECT", "changed.com"))
+                .replace("host/*@EXAMPLE.COM", "missing-realm");
+
+        assertThrows(ConfiguratorException.class, () -> applyConfig(invalid));
+
+        assertEquals("acme.com", plugin.getRedirect());
+        assertSame(filter, plugin.getFilter());
+        assertEquals(Collections.singletonList("host/*@example.com"), plugin.getMachinePrincipalPatterns());
+    }
+
+    @Test
     public void extraKeys() throws Exception {
         try {
             applyConfig(getJcascYaml("extraKeys"));

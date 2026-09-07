@@ -255,6 +255,10 @@ public class PluginImpl extends GlobalConfiguration {
 
             // Starting with data that needs validation to not break an existing configuration.
 
+            List<String> patterns = data.has("machinePrincipalPatterns")
+                    ? parseMachinePrincipalPatterns((String)data.get("machinePrincipalPatterns"))
+                    : new ArrayList<>();
+
             changeLoginLocation((String)data.get("loginLocation"));
 
             if (data.has("redirectEnabled")) {
@@ -290,9 +294,7 @@ public class PluginImpl extends GlobalConfiguration {
             this.bypassPaths = data.has("bypassPaths")
                     ? normalizeBypassPaths(splitBypassPaths((String)data.get("bypassPaths")))
                     : new ArrayList<>();
-            this.machinePrincipalPatterns = data.has("machinePrincipalPatterns")
-                    ? parseMachinePrincipalPatterns((String)data.get("machinePrincipalPatterns"))
-                    : new ArrayList<>();
+            this.machinePrincipalPatterns = patterns;
 
             this.allowLocalhost = (Boolean)data.get("allowLocalhost");
             this.allowBasic = (Boolean)data.get("allowBasic");
@@ -606,14 +608,15 @@ public class PluginImpl extends GlobalConfiguration {
     /**
      * Parses the text area content, reporting a bad pattern against its form field.
      *
-     * @param text Newline or comma separated patterns, possibly null.
+     * @param text Newline separated patterns, possibly null. Commas separate groups within a pattern.
      * @return Normalized patterns.
      * @throws Descriptor.FormException for a pattern that does not name a realm.
      */
     private static @NonNull List<String> parseMachinePrincipalPatterns(@CheckForNull String text)
             throws Descriptor.FormException {
         try {
-            return MachinePrincipalMapper.normalize(splitBypassPaths(text));
+            return MachinePrincipalMapper.normalize(text == null
+                    ? Collections.emptyList() : Arrays.asList(text.split("[\\r\\n]+")));
         } catch (IllegalArgumentException e) {
             throw new Descriptor.FormException(e.getMessage(), "machinePrincipalPatterns");
         }

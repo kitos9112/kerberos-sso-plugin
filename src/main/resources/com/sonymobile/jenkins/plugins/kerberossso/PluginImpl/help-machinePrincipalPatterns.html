@@ -1,35 +1,43 @@
 <div>
-  Kerberos <b>machine</b> principals that may authenticate to Jenkins, one pattern per line. Machines are
-  principals of the form <code>host/fqdn@REALM</code> (a Unix host keytab) or <code>NAME$@REALM</code>
-  (a Windows computer account). Leave empty to keep the default, where machine principals are treated
-  as unknown users and proceed anonymously.
+  Kerberos machine/service principals that may authenticate, one pattern per line. A principal whose
+  local part contains <code>/</code> or ends in <code>$</code> is treated as a machine, including
+  <code>host/fqdn@REALM</code>, <code>HTTP/server@REALM</code> and <code>NAME$@REALM</code>.
+  These names never use the security realm's user lookup, even with an empty allowlist. Upgrading
+  installations that previously resolved them through the realm need explicit patterns and grants.
 
   <p>
-    Patterns are matched case-insensitively against the whole principal, realm included, with
-    <code>*</code> as the only wildcard: <code>host/*.example.com@EXAMPLE.COM</code>,
-    <code>*$@EXAMPLE.COM</code>. Every pattern must name a realm. Prefix a pattern with <code>!</code>
-    to deny it; a deny entry always wins, so <code>!stolen-laptop$@EXAMPLE.COM</code> revokes one
-    machine admitted by a broader glob.
+    Patterns match the whole principal case-insensitively. <code>*</code> is the only wildcard and
+    is allowed only before <code>@</code>; name one nonempty, literal realm. Prefix a pattern with
+    <code>!</code> to deny it. Denial wins regardless of order and applies on the next negotiated
+    request, including one carrying a cookie; it does not stop work already running.
   </p>
 
   <p>
-    A pattern may name the groups it grants, after <code>-&gt;</code>, so classes of machine can be
-    scoped apart: <code>host/*-laptop-*.example.com@EXAMPLE.COM -&gt; laptop-callbacks</code>. Grant a
-    job to that group and only those machines may trigger it. A machine matching several patterns
-    receives the union of their groups. Group names keep their case; a deny pattern grants nothing, so
-    naming groups on one is rejected.
+    Allow patterns may grant comma-separated groups after <code>-&gt;</code>, for example
+    <code>host/ci*@EXAMPLE.COM -&gt; ci-servers, Production</code>. Matching groups are combined,
+    preserving their case, and every admitted machine also gets <code>kerberos-machines</code>.
+    Deny patterns cannot grant groups. <code>authenticated</code> is reserved and cannot be granted.
+    The identity is the lowercased full principal. Existing grants to that name or its groups apply.
   </p>
 
   <p>
-    An admitted machine authenticates as its lowercased principal, for example
-    <code>host/agent01.example.com@example.com</code>, and always belongs to
-    <code>kerberos-machines</code> as well as any groups its patterns name. It does <b>not</b> belong
-    to <code>authenticated</code> and has no permissions until you grant some. No Jenkins user record
-    is persisted for it.
+    Use explicit user/group authorization, such as Matrix Authorization. <b>Do not use machine
+    access with &ldquo;Logged-in users can do anything&rdquo;</b> or a strategy that trusts every
+    non-anonymous identity: omitting the <code>authenticated</code> authority does not restrict it.
+    For a build callback, grant the group global <code>Overall/Read</code> and only the target job's
+    <code>Job/Read</code> and <code>Job/Build</code>. Other or anonymous grants may also apply.
   </p>
 
   <p>
-    Treat these identities as low trust: any local administrator on a domain-joined host holds that
-    host's ticket. Grant the minimum the automation needs.
+    Disable <b>Allow anonymous access</b> for machine API calls. Each protected request must use
+    Kerberos; login cookies do not retain machine authentication. POST requests using Jenkins'
+    default CSRF protection still need a crumb and its session cookie. Bypassed and unprotected
+    paths, including <code>/whoAmI</code>, do not negotiate. See the README for a complete example.
+  </p>
+
+  <p>
+    Authentication itself does not create or save a Jenkins user record; other Jenkins features or
+    plugins may do so. Treat machine identities as low trust: local administrators can use their
+    host's credentials. Grant only what the automation requires.
   </p>
 </div>

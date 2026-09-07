@@ -32,8 +32,12 @@ import hudson.model.RootAction;
 import hudson.model.User;
 import hudson.security.ACL;
 import hudson.security.ACLContext;
+import hudson.security.AuthorizationMatrixProperty;
+import hudson.security.ProjectMatrixAuthorizationStrategy;
+import hudson.security.csrf.DefaultCrumbIssuer;
 import hudson.util.PluginServletFilter;
 import jenkins.model.Jenkins;
+import jenkins.security.seed.UserSeedProperty;
 import net.sf.json.JSONObject;
 import org.apache.http.client.methods.CloseableHttpResponse;
 import org.apache.http.client.methods.HttpGet;
@@ -42,6 +46,7 @@ import org.apache.http.impl.client.BasicCookieStore;
 import org.apache.http.impl.client.CloseableHttpClient;
 import org.apache.http.impl.client.HttpClients;
 import org.apache.http.util.EntityUtils;
+import org.jenkinsci.plugins.matrixauth.PermissionEntry;
 import org.junit.After;
 import org.junit.Before;
 import org.junit.Rule;
@@ -49,6 +54,7 @@ import org.junit.Test;
 import org.jvnet.hudson.test.JenkinsRule;
 import org.jvnet.hudson.test.MockAuthorizationStrategy;
 import org.jvnet.hudson.test.TestExtension;
+import org.kohsuke.stapler.StaplerRequest2;
 import org.kohsuke.stapler.StaplerResponse2;
 import org.springframework.security.access.AccessDeniedException;
 import org.springframework.security.core.Authentication;
@@ -59,6 +65,7 @@ import jakarta.servlet.http.HttpServletRequest;
 import jakarta.servlet.http.HttpServletResponse;
 import javax.security.auth.kerberos.KerberosPrincipal;
 import java.io.IOException;
+import java.lang.reflect.Field;
 import java.util.Arrays;
 import java.util.Collections;
 import java.util.List;
@@ -66,6 +73,7 @@ import java.util.stream.Collectors;
 
 import static org.junit.Assert.assertEquals;
 import static org.junit.Assert.assertFalse;
+import static org.junit.Assert.assertNotNull;
 import static org.junit.Assert.assertThrows;
 import static org.junit.Assert.assertTrue;
 import static org.mockito.ArgumentMatchers.any;
@@ -82,6 +90,7 @@ public class MachinePrincipalTest {
     public JenkinsRule rule = new JenkinsRule();
 
     private KerberosSSOFilter filter;
+    private boolean ticketAvailable = true;
 
     @Before
     public void setUp() {
@@ -93,7 +102,7 @@ public class MachinePrincipalTest {
     @After
     public void tearDown() throws ServletException {
         if (filter != null) {
-            PluginServletFilter.removeFilter(filter);
+            PluginImpl.getInstance().removeFilter();
         }
     }
 
@@ -139,45 +148,53 @@ public class MachinePrincipalTest {
     }
 
     /**
-     * Machine authentication is stateless: every request must carry a ticket. No user record exists
-     * for a machine, so core's user seed check drops the authentication from the session, which suits
-     * keytab automation (nothing to hijack, nothing to expire) and matches curl --negotiate without a
-     * cookie jar. Consequence pinned here: /whoAmI, an unprotected root action the filter skips, will
-     * never report a machine identity; verify with a protected URL instead.
+     * A session cookie must not retain machine authentication, even when an endpoint creates a
+     * session and core's user seed checks are disabled. Each protected request needs a ticket.
      */
     @Test
     public void machineAuthenticationIsStatelessPerRequest() throws Exception {
         fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
         patterns("host/*@EXAMPLE.COM");
 
-        try (CloseableHttpClient client = HttpClients.custom().setDefaultCookieStore(new BasicCookieStore()).build()) {
+        boolean original = UserSeedProperty.DISABLE_USER_SEED;
+        UserSeedProperty.DISABLE_USER_SEED = true;
+        BasicCookieStore cookies = new BasicCookieStore();
+        try (CloseableHttpClient client = HttpClients.custom().setDefaultCookieStore(cookies).build()) {
             String base = rule.getURL().toExternalForm();
             try (CloseableHttpResponse first = client.execute(new HttpGet(base + "identity/"))) {
                 assertTrue(EntityUtils.toString(first.getEntity()).startsWith("host/agent01.example.com@example.com|"));
             }
+            assertFalse("the identity endpoint created a session", cookies.getCookies().isEmpty());
             try (CloseableHttpResponse second = client.execute(new HttpGet(base + "whoAmI/api/json"))) {
                 assertTrue(EntityUtils.toString(second.getEntity()).contains("\"name\":\"anonymous\""));
             }
+            ticketAvailable = false;
             try (CloseableHttpResponse third = client.execute(new HttpGet(base + "identity/"))) {
-                assertTrue("each protected request re-authenticates",
-                        EntityUtils.toString(third.getEntity()).startsWith("host/agent01.example.com@example.com|"));
+                assertEquals("a cookie alone cannot authenticate", 401, third.getStatusLine().getStatusCode());
             }
+        } finally {
+            UserSeedProperty.DISABLE_USER_SEED = original;
         }
     }
 
 
     /**
      * The use case this exists for: a class of machines granted Job/Build on one job and nothing
-     * else. Also answers two questions the design left open, namely whether a session-less identity
-     * can satisfy CSRF, and whether the build records which machine triggered it.
+     * else, using production Matrix Authorization and CSRF protection. A cookie retains the crumb
+     * session, while Kerberos authenticates each request. The build records the machine's identity.
      */
     @Test
     public void laptopGroupCanTriggerOnlyTheJobItIsGranted() throws Exception {
         FreeStyleProject callback = rule.createFreeStyleProject("callback");
         FreeStyleProject offLimits = rule.createFreeStyleProject("off-limits");
-        rule.jenkins.setAuthorizationStrategy(new MockAuthorizationStrategy()
-                .grant(Jenkins.READ).everywhere().to("laptop-callbacks")
-                .grant(Item.READ, Item.BUILD).onItems(callback).to("laptop-callbacks"));
+        ProjectMatrixAuthorizationStrategy strategy = new ProjectMatrixAuthorizationStrategy();
+        strategy.add(Jenkins.READ, PermissionEntry.group("laptop-callbacks"));
+        rule.jenkins.setAuthorizationStrategy(strategy);
+        AuthorizationMatrixProperty permissions = new AuthorizationMatrixProperty(Collections.emptyList());
+        permissions.add(Item.READ, PermissionEntry.group("laptop-callbacks"));
+        permissions.add(Item.BUILD, PermissionEntry.group("laptop-callbacks"));
+        callback.addProperty(permissions);
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
 
         fakePrincipal("host/marcos-laptop-1.remote.example.com@EXAMPLE.COM");
         patterns("host/*-laptop-*.remote.example.com@EXAMPLE.COM -> laptop-callbacks");
@@ -186,13 +203,120 @@ public class MachinePrincipalTest {
         rule.waitUntilNoActivity();
         assertEquals("the granted job ran", 1, callback.getBuilds().size());
 
-        String startedBy = callback.getLastBuild().getCauses().stream()
-                .map(Cause::getShortDescription).collect(Collectors.joining("; "));
-        System.out.println("BUILD CAUSE >>> " + startedBy);
+        Cause.UserIdCause cause = callback.getLastBuild().getCause(Cause.UserIdCause.class);
+        assertNotNull(cause);
+        assertEquals("host/marcos-laptop-1.remote.example.com@example.com", cause.getUserId());
 
         // 404 rather than 403: without Item.READ Jenkins hides the job instead of admitting it exists
         assertEquals("the ungranted job did not", 404, post("job/off-limits/build"));
         assertEquals(0, offLimits.getBuilds().size());
+    }
+
+    @Test
+    public void defaultCrumbRequiresItsSessionCookie() throws Exception {
+        FreeStyleProject callback = rule.createFreeStyleProject("callback");
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
+        fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
+        patterns("host/*@EXAMPLE.COM");
+
+        assertEquals("a crumb without its cookie is invalid", 403, post("job/callback/build", false));
+        assertEquals(0, callback.getBuilds().size());
+    }
+
+    @Test
+    public void machinePostRequiresBothTicketAndValidCrumb() throws Exception {
+        FreeStyleProject callback = rule.createFreeStyleProject("callback");
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
+        fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
+        patterns("host/*@EXAMPLE.COM");
+        try (CloseableHttpClient client = HttpClients.custom().setDefaultCookieStore(new BasicCookieStore()).build()) {
+            JSONObject crumb = crumb(client);
+            String url = rule.getURL().toExternalForm() + "job/callback/build";
+            try (CloseableHttpResponse missing = client.execute(new HttpPost(url))) {
+                assertEquals(403, missing.getStatusLine().getStatusCode());
+            }
+            HttpPost invalid = new HttpPost(url);
+            invalid.setHeader(crumb.getString("crumbRequestField"), "invalid");
+            try (CloseableHttpResponse response = client.execute(invalid)) {
+                assertEquals(403, response.getStatusLine().getStatusCode());
+            }
+            ticketAvailable = false;
+            HttpPost noTicket = new HttpPost(url);
+            noTicket.setHeader(crumb.getString("crumbRequestField"), crumb.getString("crumb"));
+            try (CloseableHttpResponse response = client.execute(noTicket)) {
+                assertEquals(401, response.getStatusLine().getStatusCode());
+                assertEquals("Negotiate", response.getFirstHeader("WWW-Authenticate").getValue());
+            }
+        }
+        assertEquals(0, callback.getBuilds().size());
+        assertTrue(rule.jenkins.getQueue().isEmpty());
+    }
+
+    @Test
+    public void preCrumbAuthenticationRespectsDisabledAndBypassedConfigurations() throws Exception {
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
+        fakePrincipal("host/agent01.example.com@EXAMPLE.COM");
+        ticketAvailable = false;
+        PluginImpl plugin = PluginImpl.getInstance();
+        String url = rule.getURL().toExternalForm() + "identity/";
+        try (CloseableHttpClient client = HttpClients.createMinimal()) {
+            // Empty patterns preserve the existing crumb-first behavior.
+            try (CloseableHttpResponse response = client.execute(new HttpPost(url))) {
+                assertEquals(403, response.getStatusLine().getStatusCode());
+            }
+            patterns("host/*@EXAMPLE.COM");
+            plugin.setEnabled(false);
+            try (CloseableHttpResponse response = client.execute(new HttpPost(url))) {
+                assertEquals(403, response.getStatusLine().getStatusCode());
+            }
+            plugin.setEnabled(true);
+            plugin.setBypassPaths(Collections.singletonList("/identity"));
+            try (CloseableHttpResponse response = client.execute(new HttpPost(url))) {
+                assertEquals(403, response.getStatusLine().getStatusCode());
+            }
+        }
+    }
+
+    @Test
+    public void denyRevokesPostWithAnExistingCrumbAndCookie() throws Exception {
+        FreeStyleProject callback = rule.createFreeStyleProject("callback");
+        rule.jenkins.setCrumbIssuer(new DefaultCrumbIssuer(false));
+        fakePrincipal("STOLEN$@EXAMPLE.COM");
+        patterns("*$@EXAMPLE.COM");
+        try (CloseableHttpClient client = HttpClients.custom().setDefaultCookieStore(new BasicCookieStore()).build()) {
+            JSONObject crumb = crumb(client);
+            patterns("*$@EXAMPLE.COM", "!stolen$@EXAMPLE.COM");
+            HttpPost revoked = new HttpPost(rule.getURL().toExternalForm() + "job/callback/build");
+            revoked.setHeader(crumb.getString("crumbRequestField"), crumb.getString("crumb"));
+            try (CloseableHttpResponse response = client.execute(revoked)) {
+                assertEquals(403, response.getStatusLine().getStatusCode());
+            }
+        }
+        assertEquals(0, callback.getBuilds().size());
+        assertTrue(rule.jenkins.getQueue().isEmpty());
+    }
+
+    @Test
+    public void denyRevokesMachineWithAnExistingSessionCookie() throws Exception {
+        fakePrincipal("STOLEN$@EXAMPLE.COM");
+        patterns("*$@EXAMPLE.COM");
+        boolean original = UserSeedProperty.DISABLE_USER_SEED;
+        UserSeedProperty.DISABLE_USER_SEED = true;
+        BasicCookieStore cookies = new BasicCookieStore();
+        try (CloseableHttpClient client = HttpClients.custom().setDefaultCookieStore(cookies).build()) {
+            String url = rule.getURL().toExternalForm() + "identity/";
+            try (CloseableHttpResponse first = client.execute(new HttpGet(url))) {
+                assertTrue(EntityUtils.toString(first.getEntity()).startsWith("stolen$@example.com|"));
+            }
+            assertFalse(cookies.getCookies().isEmpty());
+            patterns("*$@EXAMPLE.COM", "!stolen$@EXAMPLE.COM");
+            try (CloseableHttpResponse next = client.execute(new HttpGet(url))) {
+                assertTrue("deny takes effect on the next request",
+                        EntityUtils.toString(next.getEntity()).startsWith("anonymous|"));
+            }
+        } finally {
+            UserSeedProperty.DISABLE_USER_SEED = original;
+        }
     }
 
     @Test
@@ -272,7 +396,9 @@ public class MachinePrincipalTest {
         @Override public String getDisplayName() { return null; }
         @Override public String getUrlName() { return "identity"; }
 
-        public void doIndex(StaplerResponse2 rsp) throws IOException {
+        public void doIndex(StaplerRequest2 req, StaplerResponse2 rsp) throws IOException {
+            // Exercise session persistence as real endpoints (including the crumb issuer) can.
+            req.getSession();
             Authentication a = Jenkins.getAuthentication2();
             rsp.setContentType("text/plain;charset=UTF-8");
             rsp.getWriter().print(a.getName() + "|" + a.getAuthorities().stream()
@@ -304,19 +430,29 @@ public class MachinePrincipalTest {
 
     /** @return status of a POST, fetching a CSRF crumb first when the controller issues one. */
     private int post(String path) throws IOException {
-        try (CloseableHttpClient client = HttpClients.createMinimal()) {
+        return post(path, true);
+    }
+
+    private int post(String path, boolean retainCookie) throws IOException {
+        try (CloseableHttpClient client = retainCookie
+                ? HttpClients.custom().setDefaultCookieStore(new BasicCookieStore()).build()
+                : HttpClients.createMinimal()) {
             String base = rule.getURL().toExternalForm();
             HttpPost req = new HttpPost(base + path);
-            try (CloseableHttpResponse crumb = client.execute(new HttpGet(base + "crumbIssuer/api/json"))) {
-                if (crumb.getStatusLine().getStatusCode() == 200) {
-                    JSONObject json = JSONObject.fromObject(EntityUtils.toString(crumb.getEntity()));
-                    req.addHeader(json.getString("crumbRequestField"), json.getString("crumb"));
-                }
-            }
+            JSONObject crumb = crumb(client);
+            req.addHeader(crumb.getString("crumbRequestField"), crumb.getString("crumb"));
             try (CloseableHttpResponse response = client.execute(req)) {
                 EntityUtils.consumeQuietly(response.getEntity());
                 return response.getStatusLine().getStatusCode();
             }
+        }
+    }
+
+    private JSONObject crumb(CloseableHttpClient client) throws IOException {
+        String url = rule.getURL().toExternalForm() + "crumbIssuer/api/json";
+        try (CloseableHttpResponse response = client.execute(new HttpGet(url))) {
+            assertEquals("crumb acquisition must succeed", 200, response.getStatusLine().getStatusCode());
+            return JSONObject.fromObject(EntityUtils.toString(response.getEntity()));
         }
     }
 
@@ -327,8 +463,21 @@ public class MachinePrincipalTest {
     private void fakePrincipal(String principal) throws Exception {
         KerberosAuthenticator mockAuthenticator = mock(KerberosAuthenticator.class);
         when(mockAuthenticator.authenticate(any(HttpServletRequest.class), any(HttpServletResponse.class)))
-                .thenReturn(new KerberosPrincipal(principal));
+                .thenAnswer(invocation -> {
+                    if (!ticketAvailable) {
+                        HttpServletResponse response = invocation.getArgument(1);
+                        response.setHeader("WWW-Authenticate", "Negotiate");
+                        response.setStatus(HttpServletResponse.SC_UNAUTHORIZED);
+                        return null;
+                    }
+                    return new KerberosPrincipal(principal);
+                });
         filter = new KerberosSSOFilter(Collections.emptyMap(), config -> mockAuthenticator);
         PluginServletFilter.addFilter(filter);
+        // Publish the same filter the plugin lifecycle normally registers, retaining the mock KDC boundary.
+        Field activeFilter = PluginImpl.class.getDeclaredField("filter");
+        activeFilter.setAccessible(true);
+        activeFilter.set(PluginImpl.getInstance(), filter);
+        PluginImpl.getInstance().setEnabled(true);
     }
 }
